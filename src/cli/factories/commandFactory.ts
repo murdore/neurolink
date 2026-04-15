@@ -28,6 +28,7 @@ import {
   ContextFactory,
 } from "../../lib/types/index.js";
 import { checkRedisAvailability } from "../../lib/utils/conversationMemory.js";
+import { ContextCommandFactory } from "../commands/context.js";
 import { normalizeEvaluationData } from "../../lib/utils/evaluationUtils.js";
 import { logger } from "../../lib/utils/logger.js";
 import { createThinkingConfigFromRecord } from "../../lib/utils/thinkingConfig.js";
@@ -272,6 +273,38 @@ export class CLICommandFactory {
       description: "JSON context object for custom data",
     },
 
+    // Dynamic argument context options
+    userId: {
+      type: "string" as const,
+      description:
+        "User ID for dynamic argument resolution and context-aware configuration",
+    },
+    userEmail: {
+      type: "string" as const,
+      description: "User email for dynamic argument resolution",
+    },
+    tenantId: {
+      type: "string" as const,
+      description:
+        "Tenant/organization ID for multi-tenant context-aware configuration",
+    },
+    tenantPlan: {
+      type: "string" as const,
+      choices: ["free", "starter", "pro", "enterprise"],
+      description:
+        "Tenant subscription plan for tier-based dynamic configuration",
+    },
+    sessionId: {
+      type: "string" as const,
+      description: "Session ID for request context tracking",
+    },
+    runtimeContext: {
+      type: "string" as const,
+      alias: "context-json",
+      description:
+        'JSON object with runtime context values for dynamic arguments (e.g., {"taskType": "analysis", "priority": "high"})',
+    },
+
     // Debug & output options
     debug: {
       type: "boolean" as const,
@@ -492,6 +525,109 @@ export class CLICommandFactory {
       ...CLICommandFactory.commonOptions,
       ...additionalOptions,
     });
+  }
+
+  /**
+   * Build a partial RequestContext from CLI dynamic-argument flags
+   */
+  private static buildDynamicRequestContext(
+    argv: Record<string, unknown>,
+  ): Record<string, unknown> | undefined {
+    // Merge stored context (from `neurolink context set`) with CLI flags.
+    // CLI flags take precedence over stored values.
+    const stored = ContextCommandFactory.getCurrentContext();
+
+    const hasContextFlags = !!(
+      argv.userId ||
+      argv.userEmail ||
+      argv.tenantId ||
+      argv.tenantPlan ||
+      argv.sessionId ||
+      argv.runtimeContext ||
+      stored.userId ||
+      stored.tenantId
+    );
+
+    if (!hasContextFlags) {
+      return undefined;
+    }
+
+    const effectiveUserId = (argv.userId as string) || stored.userId;
+    const effectiveEmail = (argv.userEmail as string) || stored.userEmail;
+    const user =
+      effectiveUserId || effectiveEmail
+        ? {
+            id: effectiveUserId || effectiveEmail!,
+            ...(effectiveEmail ? { email: effectiveEmail } : {}),
+          }
+        : undefined;
+
+    const effectiveTenantId = (argv.tenantId as string) || stored.tenantId;
+    const effectiveTenantPlan =
+      (argv.tenantPlan as string) || stored.tenantPlan;
+
+    if (effectiveTenantPlan && !effectiveTenantId) {
+      throw new Error(
+        "--tenant-id is required when --tenant-plan is specified",
+      );
+    }
+
+    const tenant = effectiveTenantId
+      ? {
+          id: effectiveTenantId,
+          ...(effectiveTenantPlan
+            ? {
+                plan: effectiveTenantPlan as
+                  | "free"
+                  | "starter"
+                  | "pro"
+                  | "enterprise",
+              }
+            : {}),
+        }
+      : undefined;
+
+    const effectiveSessionId = (argv.sessionId as string) || stored.sessionId;
+    const session = effectiveSessionId
+      ? {
+          id: effectiveSessionId,
+          startedAt: Date.now(),
+        }
+      : undefined;
+
+    let runtime: Map<string, unknown> | undefined;
+    // Merge stored runtimeContext as base, CLI --runtime-context overrides
+    const baseRuntime = stored.runtimeContext
+      ? new Map(Object.entries(stored.runtimeContext))
+      : undefined;
+    if (argv.runtimeContext) {
+      try {
+        const runtimeObj =
+          typeof argv.runtimeContext === "string"
+            ? JSON.parse(argv.runtimeContext)
+            : argv.runtimeContext;
+        if (runtimeObj && typeof runtimeObj === "object") {
+          runtime = new Map([
+            ...(baseRuntime || []),
+            ...Object.entries(runtimeObj),
+          ]);
+        }
+      } catch (error) {
+        throw new Error(
+          `Invalid JSON in --runtime-context: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
+    } else if (baseRuntime) {
+      runtime = baseRuntime;
+    }
+
+    return {
+      ...(user && { user }),
+      ...(tenant && { tenant }),
+      ...(session && { session }),
+      ...(runtime && { runtime }),
+    };
   }
 
   // Helper method to process CLI images with smart auto-detection
@@ -2590,84 +2726,92 @@ export class CLICommandFactory {
         enhancedOptions,
       );
 
-      // Execute generation
-      const result = await sdk.generate({
-        input: generateInput,
-        csvOptions: {
-          maxRows: argv.csvMaxRows as number | undefined,
-          formatStyle: argv.csvFormat as
-            | "raw"
-            | "markdown"
-            | "json"
+      // Execute generation (wrapped in dynamic context if CLI flags present)
+      const dynamicCtx = CLICommandFactory.buildDynamicRequestContext(argv);
+      const runGenerate = () =>
+        sdk.generate({
+          input: generateInput,
+          csvOptions: {
+            maxRows: argv.csvMaxRows as number | undefined,
+            formatStyle: argv.csvFormat as
+              | "raw"
+              | "markdown"
+              | "json"
+              | undefined,
+          },
+          videoOptions: {
+            frames: argv.videoFrames as number | undefined,
+            quality: argv.videoQuality as number | undefined,
+            format: argv.videoFormat as "jpeg" | "png" | undefined,
+            transcribeAudio: argv.transcribeAudio as boolean | undefined,
+          },
+          output: outputConfig,
+          provider: enhancedOptions.provider,
+          model: enhancedOptions.model,
+          temperature: enhancedOptions.temperature,
+          maxTokens: enhancedOptions.maxTokens,
+          systemPrompt: enhancedOptions.systemPrompt,
+          timeout: enhancedOptions.timeout
+            ? enhancedOptions.timeout * 1000
+            : undefined,
+          disableTools: enhancedOptions.disableTools,
+          enableAnalytics: enhancedOptions.enableAnalytics,
+          enableEvaluation: enhancedOptions.enableEvaluation,
+          evaluationDomain: enhancedOptions.evaluationDomain as
+            | string
             | undefined,
-        },
-        videoOptions: {
-          frames: argv.videoFrames as number | undefined,
-          quality: argv.videoQuality as number | undefined,
-          format: argv.videoFormat as "jpeg" | "png" | undefined,
-          transcribeAudio: argv.transcribeAudio as boolean | undefined,
-        },
-        output: outputConfig,
-        provider: enhancedOptions.provider,
-        model: enhancedOptions.model,
-        temperature: enhancedOptions.temperature,
-        maxTokens: enhancedOptions.maxTokens,
-        systemPrompt: enhancedOptions.systemPrompt,
-        timeout: enhancedOptions.timeout
-          ? enhancedOptions.timeout * 1000
-          : undefined,
-        disableTools: enhancedOptions.disableTools,
-        enableAnalytics: enhancedOptions.enableAnalytics,
-        enableEvaluation: enhancedOptions.enableEvaluation,
-        evaluationDomain: enhancedOptions.evaluationDomain as
-          | string
-          | undefined,
-        toolUsageContext: enhancedOptions.toolUsageContext as
-          | string
-          | undefined,
-        context: context,
-        region: (options as Record<string, unknown>).region as
-          | string
-          | undefined,
-        thinkingConfig: createThinkingConfigFromRecord(
-          options as Record<string, unknown>,
-        ),
-        factoryConfig: enhancedOptions.domain
-          ? {
-              domainType: enhancedOptions.domain,
-              enhancementType: "domain-configuration",
-              validateDomainData: true,
-            }
-          : undefined,
-        // RAG configuration
-        rag: (argv.ragFiles as string[] | undefined)?.length
-          ? {
-              files: argv.ragFiles as string[],
-              strategy: argv.ragStrategy as ChunkingStrategy | undefined,
-              chunkSize: argv.ragChunkSize as number | undefined,
-              chunkOverlap: argv.ragChunkOverlap as number | undefined,
-              topK: argv.ragTopK as number | undefined,
-            }
-          : undefined,
-        // TTS configuration
-        tts: enhancedOptions.tts
-          ? {
-              enabled: true,
-              useAiResponse: true,
-              voice: enhancedOptions.ttsVoice as string | undefined,
-              format:
-                (enhancedOptions.ttsFormat as "mp3" | "wav" | "ogg" | "opus") ||
-                undefined,
-              speed: enhancedOptions.ttsSpeed as number | undefined,
-              quality: enhancedOptions.ttsQuality as
-                | "standard"
-                | "hd"
-                | undefined,
-              output: enhancedOptions.ttsOutput as string | undefined,
-              play: enhancedOptions.ttsPlay as boolean | undefined,
-            }
-          : undefined,
-      });
+          toolUsageContext: enhancedOptions.toolUsageContext as
+            | string
+            | undefined,
+          context: context,
+          region: (options as Record<string, unknown>).region as
+            | string
+            | undefined,
+          thinkingConfig: createThinkingConfigFromRecord(
+            options as Record<string, unknown>,
+          ),
+          factoryConfig: enhancedOptions.domain
+            ? {
+                domainType: enhancedOptions.domain,
+                enhancementType: "domain-configuration",
+                validateDomainData: true,
+              }
+            : undefined,
+          // RAG configuration
+          rag: (argv.ragFiles as string[] | undefined)?.length
+            ? {
+                files: argv.ragFiles as string[],
+                strategy: argv.ragStrategy as ChunkingStrategy | undefined,
+                chunkSize: argv.ragChunkSize as number | undefined,
+                chunkOverlap: argv.ragChunkOverlap as number | undefined,
+                topK: argv.ragTopK as number | undefined,
+              }
+            : undefined,
+          // TTS configuration
+          tts: enhancedOptions.tts
+            ? {
+                enabled: true,
+                useAiResponse: true,
+                voice: enhancedOptions.ttsVoice as string | undefined,
+                format:
+                  (enhancedOptions.ttsFormat as
+                    | "mp3"
+                    | "wav"
+                    | "ogg"
+                    | "opus") || undefined,
+                speed: enhancedOptions.ttsSpeed as number | undefined,
+                quality: enhancedOptions.ttsQuality as
+                  | "standard"
+                  | "hd"
+                  | undefined,
+                output: enhancedOptions.ttsOutput as string | undefined,
+                play: enhancedOptions.ttsPlay as boolean | undefined,
+              }
+            : undefined,
+        });
+      const result = await (dynamicCtx
+        ? sdk.withContext(dynamicCtx, runGenerate)
+        : runGenerate());
 
       // Handle successful result
       await CLICommandFactory.handleGenerateSuccess(
@@ -2855,79 +2999,96 @@ export class CLICommandFactory {
       argv.file as string | string[] | undefined,
     );
 
-    const stream = await sdk.stream({
-      input: {
-        text: inputText,
-        ...(imageBuffers && { images: imageBuffers }),
-        ...(csvFiles && { csvFiles }),
-        ...(pdfFiles && { pdfFiles }),
-        ...(videoFiles && { videoFiles }),
-        ...(files && { files }),
-      },
-      csvOptions: {
-        maxRows: argv.csvMaxRows as number | undefined,
-        formatStyle: argv.csvFormat as "raw" | "markdown" | "json" | undefined,
-      },
-      videoOptions: {
-        frames: argv.videoFrames as number | undefined,
-        quality: argv.videoQuality as number | undefined,
-        format: argv.videoFormat as "jpeg" | "png" | undefined,
-        transcribeAudio: argv.transcribeAudio as boolean | undefined,
-      },
-      provider: enhancedOptions.provider as string | undefined,
-      model: enhancedOptions.model as string | undefined,
-      temperature: enhancedOptions.temperature as number | undefined,
-      maxTokens: enhancedOptions.maxTokens as number | undefined,
-      systemPrompt: enhancedOptions.systemPrompt as string | undefined,
-      timeout: enhancedOptions.timeout
-        ? (enhancedOptions.timeout as number) * 1000
-        : undefined,
-      disableTools: enhancedOptions.disableTools as boolean | undefined,
-      enableAnalytics: enhancedOptions.enableAnalytics as boolean | undefined,
-      enableEvaluation: enhancedOptions.enableEvaluation as boolean | undefined,
-      evaluationDomain: enhancedOptions.evaluationDomain as string | undefined,
-      toolUsageContext: enhancedOptions.toolUsageContext as string | undefined,
-      context: context,
-      region: (options as Record<string, unknown>).region as string | undefined,
-      thinkingConfig: createThinkingConfigFromRecord(
-        options as Record<string, unknown>,
-      ),
-      factoryConfig: enhancedOptions.domain
-        ? {
-            domainType: enhancedOptions.domain as string,
-            enhancementType: "domain-configuration",
-            validateDomainData: true,
-          }
-        : undefined,
-      // RAG configuration
-      rag: (argv.ragFiles as string[] | undefined)?.length
-        ? {
-            files: argv.ragFiles as string[],
-            strategy: argv.ragStrategy as ChunkingStrategy | undefined,
-            chunkSize: argv.ragChunkSize as number | undefined,
-            chunkOverlap: argv.ragChunkOverlap as number | undefined,
-            topK: argv.ragTopK as number | undefined,
-          }
-        : undefined,
-      // TTS configuration
-      tts: enhancedOptions.tts
-        ? {
-            enabled: true,
-            useAiResponse: true,
-            voice: enhancedOptions.ttsVoice as string | undefined,
-            format:
-              (enhancedOptions.ttsFormat as "mp3" | "wav" | "ogg" | "opus") ||
-              undefined,
-            speed: enhancedOptions.ttsSpeed as number | undefined,
-            quality: enhancedOptions.ttsQuality as
-              | "standard"
-              | "hd"
-              | undefined,
-            output: enhancedOptions.ttsOutput as string | undefined,
-            play: enhancedOptions.ttsPlay as boolean | undefined,
-          }
-        : undefined,
-    });
+    const streamDynamicCtx = CLICommandFactory.buildDynamicRequestContext(argv);
+    const runStream = () =>
+      sdk.stream({
+        input: {
+          text: inputText,
+          ...(imageBuffers && { images: imageBuffers }),
+          ...(csvFiles && { csvFiles }),
+          ...(pdfFiles && { pdfFiles }),
+          ...(videoFiles && { videoFiles }),
+          ...(files && { files }),
+        },
+        csvOptions: {
+          maxRows: argv.csvMaxRows as number | undefined,
+          formatStyle: argv.csvFormat as
+            | "raw"
+            | "markdown"
+            | "json"
+            | undefined,
+        },
+        videoOptions: {
+          frames: argv.videoFrames as number | undefined,
+          quality: argv.videoQuality as number | undefined,
+          format: argv.videoFormat as "jpeg" | "png" | undefined,
+          transcribeAudio: argv.transcribeAudio as boolean | undefined,
+        },
+        provider: enhancedOptions.provider as string | undefined,
+        model: enhancedOptions.model as string | undefined,
+        temperature: enhancedOptions.temperature as number | undefined,
+        maxTokens: enhancedOptions.maxTokens as number | undefined,
+        systemPrompt: enhancedOptions.systemPrompt as string | undefined,
+        timeout: enhancedOptions.timeout
+          ? (enhancedOptions.timeout as number) * 1000
+          : undefined,
+        disableTools: enhancedOptions.disableTools as boolean | undefined,
+        enableAnalytics: enhancedOptions.enableAnalytics as boolean | undefined,
+        enableEvaluation: enhancedOptions.enableEvaluation as
+          | boolean
+          | undefined,
+        evaluationDomain: enhancedOptions.evaluationDomain as
+          | string
+          | undefined,
+        toolUsageContext: enhancedOptions.toolUsageContext as
+          | string
+          | undefined,
+        context: context,
+        region: (options as Record<string, unknown>).region as
+          | string
+          | undefined,
+        thinkingConfig: createThinkingConfigFromRecord(
+          options as Record<string, unknown>,
+        ),
+        factoryConfig: enhancedOptions.domain
+          ? {
+              domainType: enhancedOptions.domain as string,
+              enhancementType: "domain-configuration",
+              validateDomainData: true,
+            }
+          : undefined,
+        // RAG configuration
+        rag: (argv.ragFiles as string[] | undefined)?.length
+          ? {
+              files: argv.ragFiles as string[],
+              strategy: argv.ragStrategy as ChunkingStrategy | undefined,
+              chunkSize: argv.ragChunkSize as number | undefined,
+              chunkOverlap: argv.ragChunkOverlap as number | undefined,
+              topK: argv.ragTopK as number | undefined,
+            }
+          : undefined,
+        // TTS configuration
+        tts: enhancedOptions.tts
+          ? {
+              enabled: true,
+              useAiResponse: true,
+              voice: enhancedOptions.ttsVoice as string | undefined,
+              format:
+                (enhancedOptions.ttsFormat as "mp3" | "wav" | "ogg" | "opus") ||
+                undefined,
+              speed: enhancedOptions.ttsSpeed as number | undefined,
+              quality: enhancedOptions.ttsQuality as
+                | "standard"
+                | "hd"
+                | undefined,
+              output: enhancedOptions.ttsOutput as string | undefined,
+              play: enhancedOptions.ttsPlay as boolean | undefined,
+            }
+          : undefined,
+      });
+    const stream = await (streamDynamicCtx
+      ? sdk.withContext(streamDynamicCtx, runStream)
+      : runStream());
 
     const streamResult = await CLICommandFactory.processStreamWithTimeout(
       stream,
@@ -3453,32 +3614,38 @@ export class CLICommandFactory {
             ? { ...contextMetadata, sessionId }
             : contextMetadata;
 
-          const result = await sdk.generate({
-            input: { text: inputText },
-            provider: enhancedOptions.provider,
-            model: enhancedOptions.model,
-            temperature: enhancedOptions.temperature,
-            maxTokens: enhancedOptions.maxTokens,
-            systemPrompt: enhancedOptions.systemPrompt,
-            timeout: enhancedOptions.timeout
-              ? enhancedOptions.timeout * 1000
-              : undefined,
-            disableTools: enhancedOptions.disableTools,
-            evaluationDomain: enhancedOptions.evaluationDomain as
-              | string
-              | undefined,
-            toolUsageContext: enhancedOptions.toolUsageContext as
-              | string
-              | undefined,
-            context: context,
-            factoryConfig: enhancedOptions.domain
-              ? {
-                  domainType: enhancedOptions.domain as string,
-                  enhancementType: "domain-configuration",
-                  validateDomainData: true,
-                }
-              : undefined,
-          });
+          const batchDynamicCtx =
+            CLICommandFactory.buildDynamicRequestContext(argv);
+          const runBatchGenerate = () =>
+            sdk.generate({
+              input: { text: inputText },
+              provider: enhancedOptions.provider,
+              model: enhancedOptions.model,
+              temperature: enhancedOptions.temperature,
+              maxTokens: enhancedOptions.maxTokens,
+              systemPrompt: enhancedOptions.systemPrompt,
+              timeout: enhancedOptions.timeout
+                ? enhancedOptions.timeout * 1000
+                : undefined,
+              disableTools: enhancedOptions.disableTools,
+              evaluationDomain: enhancedOptions.evaluationDomain as
+                | string
+                | undefined,
+              toolUsageContext: enhancedOptions.toolUsageContext as
+                | string
+                | undefined,
+              context: context,
+              factoryConfig: enhancedOptions.domain
+                ? {
+                    domainType: enhancedOptions.domain as string,
+                    enhancementType: "domain-configuration",
+                    validateDomainData: true,
+                  }
+                : undefined,
+            });
+          const result = await (batchDynamicCtx
+            ? sdk.withContext(batchDynamicCtx, runBatchGenerate)
+            : runBatchGenerate());
 
           results.push({ prompt: prompts[i], response: result.content });
 

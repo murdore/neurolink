@@ -40,7 +40,7 @@ export { GoogleTTSHandler } from "./adapters/tts/googleTTSHandler.js";
 // Config Manager export
 export { NeuroLinkConfigManager as ConfigManager } from "./config/configManager.js";
 
-// Core Infrastructure exports (Mastra-inspired patterns)
+// Core Infrastructure exports (factory + registry patterns)
 export {
   BaseFactory,
   BaseRegistry,
@@ -238,6 +238,26 @@ export { SpanSerializer } from "./observability/utils/spanSerializer.js";
 
 // Version
 export const VERSION = "1.0.0";
+
+// ============================================================================
+// Dynamic Arguments
+// ============================================================================
+//
+// Dynamic arguments let you pass functions instead of static values to
+// generate() and stream(). Resolution happens automatically before
+// provider dispatch. Use neurolink.withContext() to set per-request
+// user/tenant/session context that dynamic functions can read.
+//
+// Example:
+//   await neurolink.withContext(
+//     { user: { id: "u1" }, tenant: { id: "t1", plan: "enterprise" } },
+//     () => neurolink.generate({
+//       input: { text: "Hello" },
+//       model: (ctx) => ctx.requestContext.tenant?.plan === "enterprise"
+//         ? "gpt-4o" : "gpt-4o-mini",
+//     })
+//   );
+// ============================================================================
 
 /**
  * Quick start factory function for creating AI provider instances.
@@ -604,7 +624,7 @@ export async function getTelemetryStatus(): Promise<{
 export {
   // Main Evaluator
   Evaluator,
-  // Factory and Registry (Mastra-inspired patterns)
+  // Factory and Registry
   EvaluationAggregator,
   EvaluatorFactory,
   getEvaluatorFactory,

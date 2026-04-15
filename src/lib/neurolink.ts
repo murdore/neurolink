@@ -54,7 +54,7 @@ import type {
   AuthenticatedContext,
   AuthProviderConfig,
   AuthProviderType,
-  MastraAuthProvider,
+  AuthProvider,
   JsonObject,
   JsonValue,
   NeuroLinkEvents,
@@ -131,6 +131,20 @@ import { ToolRouter } from "./mcp/routing/index.js";
 import { directToolsServer } from "./mcp/servers/agent/directToolsServer.js";
 import { inferAnnotations, isSafeToRetry } from "./mcp/toolAnnotations.js";
 import { MCPToolRegistry } from "./mcp/toolRegistry.js";
+// Dynamic argument resolution imports
+import { resolveDynamicArgument } from "./dynamic/dynamicResolver.js";
+import {
+  withRequestContext,
+  getCurrentContext,
+  createResolutionContextFromRequest,
+  createRequestContext as createDynRequestContext,
+} from "./dynamic/requestContext.js";
+import type {
+  DynamicGenerateOptions,
+  DynamicStreamOptions,
+  DynamicResolutionContext,
+  DynamicRequestContext,
+} from "./types/index.js";
 import type { HippocampusConfig } from "@juspay/hippocampus";
 import { initializeHippocampus } from "./memory/hippocampusInitializer.js";
 import { createMemoryRetrievalTools } from "./memory/memoryRetrievalTools.js";
@@ -540,7 +554,7 @@ export class NeuroLink {
   private enableOrchestration: boolean;
 
   // Authentication provider for secure access control
-  private authProvider?: MastraAuthProvider;
+  private authProvider?: AuthProvider;
   private pendingAuthConfig?: NeuroLinkAuthConfig;
   private authInitPromise?: Promise<void>;
 
@@ -788,9 +802,7 @@ export class NeuroLink {
         );
       }
 
-      let authResult: Awaited<
-        ReturnType<MastraAuthProvider["authenticateToken"]>
-      >;
+      let authResult: Awaited<ReturnType<AuthProvider["authenticateToken"]>>;
       try {
         authResult = await withTimeout(
           this.authProvider.authenticateToken(options.auth.token),
@@ -3501,7 +3513,7 @@ Current user's request: ${currentInput}`;
    * @since 1.0.0
    */
   async generate(
-    optionsOrPrompt: GenerateOptions | string,
+    optionsOrPrompt: GenerateOptions | DynamicGenerateOptions | string,
   ): Promise<GenerateResult> {
     return tracers.sdk.startActiveSpan(
       "neurolink.generate",
@@ -3512,7 +3524,7 @@ Current user's request: ${currentInput}`;
   }
 
   private async executeGenerateWithMetricsContext(
-    optionsOrPrompt: GenerateOptions | string,
+    optionsOrPrompt: GenerateOptions | DynamicGenerateOptions | string,
     generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
   ): Promise<GenerateResult> {
     return metricsTraceContextStorage.run(
@@ -3522,14 +3534,16 @@ Current user's request: ${currentInput}`;
   }
 
   private async executeGenerateRequest(
-    optionsOrPrompt: GenerateOptions | string,
+    optionsOrPrompt: GenerateOptions | DynamicGenerateOptions | string,
     generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
   ): Promise<GenerateResult> {
+    let resolvedOptions: GenerateOptions | undefined;
     try {
       const { options, originalPrompt } = await this.prepareGenerateRequest(
         optionsOrPrompt,
         generateSpan,
       );
+      resolvedOptions = options;
       const earlyResult = await this.maybeHandleEarlyGenerateResult(
         options,
         generateSpan,
@@ -3563,7 +3577,10 @@ Current user's request: ${currentInput}`;
         );
       }
 
-      this.emitGenerateErrorEvent(optionsOrPrompt, error);
+      this.emitGenerateErrorEvent(
+        (resolvedOptions ?? optionsOrPrompt) as GenerateOptions | string,
+        error,
+      );
       throw error;
     } finally {
       this._disableToolCacheForCurrentRequest = false;
@@ -3572,17 +3589,24 @@ Current user's request: ${currentInput}`;
   }
 
   private async prepareGenerateRequest(
-    optionsOrPrompt: GenerateOptions | string,
+    optionsOrPrompt: GenerateOptions | DynamicGenerateOptions | string,
     generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
   ): Promise<{
     options: GenerateOptions;
     originalPrompt: string | undefined;
   }> {
-    const originalPrompt = this._extractOriginalPrompt(optionsOrPrompt);
+    const originalPrompt = this._extractOriginalPrompt(
+      optionsOrPrompt as GenerateOptions | string,
+    );
     const options: GenerateOptions =
       typeof optionsOrPrompt === "string"
         ? { input: { text: optionsOrPrompt } }
-        : { ...optionsOrPrompt };
+        : ({ ...optionsOrPrompt } as GenerateOptions);
+
+    // Dynamic argument resolution — resolve any function-valued options before downstream use
+    await this.resolveDynamicGenerateOptions(
+      options as Record<string, unknown>,
+    );
 
     options.model = resolveModel(options.model, this.modelAliasConfig);
     this._disableToolCacheForCurrentRequest = !!options.disableToolCache;
@@ -3803,6 +3827,7 @@ Current user's request: ${currentInput}`;
       maxSteps: options.maxSteps,
       toolChoice: options.toolChoice,
       prepareStep: options.prepareStep,
+      enabledToolNames: options.enabledToolNames,
       enableAnalytics: options.enableAnalytics,
       enableEvaluation: options.enableEvaluation,
       context: options.context as Record<string, JsonValue> | undefined,
@@ -6251,26 +6276,33 @@ Current user's request: ${currentInput}`;
    * @throws {Error} When all providers fail to generate content
    * @throws {Error} When conversation memory operations fail (if enabled)
    */
-  async stream(options: StreamOptions): Promise<StreamResult> {
+  async stream(
+    options: StreamOptions | DynamicStreamOptions,
+  ): Promise<StreamResult> {
     logger.debug("[NeuroLink] stream() called with options", {
       provider: options.provider,
       model: options.model,
       inputLength: options.input?.text?.length || 0,
-      disableTools: options.disableTools,
-      enableAnalytics: options.enableAnalytics,
-      enableEvaluation: options.enableEvaluation,
-      contextKeys: options.context ? Object.keys(options.context) : [],
+      disableTools: (options as StreamOptions).disableTools,
+      enableAnalytics: (options as StreamOptions).enableAnalytics,
+      enableEvaluation: (options as StreamOptions).enableEvaluation,
+      contextKeys: (options as StreamOptions).context
+        ? Object.keys((options as StreamOptions).context!)
+        : [],
       optionKeys: Object.keys(options),
     });
     return metricsTraceContextStorage.run(
       this.createMetricsTraceContext(),
-      () => this.executeStreamRequest({ ...options }),
+      () => this.executeStreamRequest({ ...options } as StreamOptions),
     );
   }
 
   private async executeStreamRequest(
     options: StreamOptions,
   ): Promise<StreamResult> {
+    // Dynamic argument resolution — resolve any function-valued options before downstream use
+    await this.resolveDynamicStreamOptions(options);
+
     const streamSpan = tracers.sdk.startSpan("neurolink.stream", {
       kind: SpanKind.INTERNAL,
       attributes: {
@@ -12674,18 +12706,18 @@ Current user's request: ${currentInput}`;
   private async initializeAuthProviderFromConfig(
     config: NeuroLinkAuthConfig,
   ): Promise<void> {
-    let provider: MastraAuthProvider;
+    let provider: AuthProvider;
     let providerType: string;
 
-    // Duck-type check: direct MastraAuthProvider instance
+    // Duck-type check: direct AuthProvider instance
     if (
       "authenticateToken" in config &&
-      typeof (config as MastraAuthProvider).authenticateToken === "function"
+      typeof (config as AuthProvider).authenticateToken === "function"
     ) {
-      provider = config as MastraAuthProvider;
+      provider = config as AuthProvider;
       providerType = provider.type;
     } else if ("provider" in config) {
-      provider = (config as { provider: MastraAuthProvider }).provider;
+      provider = (config as { provider: AuthProvider }).provider;
       providerType = provider.type;
     } else {
       const typedConfig = config as {
@@ -12712,7 +12744,7 @@ Current user's request: ${currentInput}`;
   /**
    * Get the currently configured authentication provider
    */
-  getAuthProvider(): MastraAuthProvider | undefined {
+  getAuthProvider(): AuthProvider | undefined {
     return this.authProvider;
   }
 
@@ -12792,6 +12824,192 @@ Current user's request: ${currentInput}`;
    */
   getExternalServerManager(): ExternalServerManager {
     return this.externalServerManager;
+  }
+
+  // ==========================================================================
+  // Dynamic Argument Resolution
+  // ==========================================================================
+
+  /**
+   * Execute a function within a dynamic argument request context.
+   * Context is available to all dynamic argument resolvers via AsyncLocalStorage.
+   */
+  async withContext<T>(
+    context: Record<string, unknown>,
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    return withRequestContext(context, fn);
+  }
+
+  /**
+   * Get the current dynamic argument request context (from AsyncLocalStorage).
+   */
+  getDynamicContext() {
+    return getCurrentContext();
+  }
+
+  /**
+   * Build a DynamicResolutionContext with NeuroLink instance adapters.
+   */
+  private buildResolutionContext(
+    signal?: AbortSignal,
+    inlineContext?: Record<string, unknown>,
+  ): DynamicResolutionContext {
+    const currentCtx = getCurrentContext();
+    // Prefer inline context (from options.context) over AsyncLocalStorage
+    const requestContext = inlineContext
+      ? createDynRequestContext(
+          inlineContext as Partial<
+            Omit<DynamicRequestContext, "requestId" | "timestamp">
+          >,
+        )
+      : currentCtx || createDynRequestContext();
+    return createResolutionContextFromRequest(
+      requestContext,
+      {
+        getAvailableTools: async () => {
+          try {
+            const tools = await this.toolRegistry.listTools();
+            return tools.map((t) => t.name);
+          } catch {
+            return [];
+          }
+        },
+        getProviderStatus: async () => {
+          // Provider health is optional adapter — return true as default
+          // (real health check available via getProviderHealth() public API)
+          return true;
+        },
+        getRuntimeContext: () => currentCtx?.runtime,
+      },
+      signal,
+    );
+  }
+
+  /**
+   * Resolve dynamic arguments in GenerateOptions, mutating the options in place.
+   * Only resolves fields that are functions; static values pass through unchanged.
+   */
+  private async resolveDynamicGenerateOptions(
+    options: Record<string, unknown>,
+  ): Promise<void> {
+    const dynamicFields = [
+      "model",
+      "provider",
+      "temperature",
+      "maxTokens",
+      "systemPrompt",
+      "timeout",
+      "thinkingLevel",
+      "disableTools",
+      "enableAnalytics",
+      "enableEvaluation",
+    ] as const;
+
+    const hasDynamic =
+      dynamicFields.some((f) => typeof options[f] === "function") ||
+      typeof options.tools === "function";
+    if (!hasDynamic) {
+      return;
+    }
+
+    // Detect inline context (user/tenant/session in options.context)
+    const inlineCtx = options.context as Record<string, unknown> | undefined;
+    const hasInlineCtx =
+      inlineCtx &&
+      typeof inlineCtx === "object" &&
+      ("user" in inlineCtx || "tenant" in inlineCtx || "session" in inlineCtx);
+
+    await this.resolveDynamicFields(
+      options,
+      dynamicFields,
+      hasInlineCtx ? inlineCtx : undefined,
+    );
+  }
+
+  private async resolveDynamicFields(
+    options: Record<string, unknown>,
+    dynamicFields: readonly string[],
+    inlineContext?: Record<string, unknown>,
+  ): Promise<void> {
+    const resolutionContext = this.buildResolutionContext(
+      options.abortSignal as AbortSignal | undefined,
+      inlineContext,
+    );
+
+    logger.debug("[NeuroLink] Resolving dynamic arguments");
+
+    await Promise.all(
+      dynamicFields.map(async (field) => {
+        if (typeof options[field] === "function") {
+          const result = await resolveDynamicArgument(
+            options[field],
+            resolutionContext,
+          );
+          options[field] = result.value;
+          logger.debug(
+            `[NeuroLink] Resolved dynamic ${field}: ${result.resolutionType}`,
+          );
+        }
+      }),
+    );
+
+    // Handle dynamic tools → enabledToolNames mapping
+    if (typeof options.tools === "function") {
+      const result = await resolveDynamicArgument(
+        options.tools,
+        resolutionContext,
+      );
+      if (Array.isArray(result.value)) {
+        options.enabledToolNames = result.value;
+        delete options.tools;
+      } else {
+        delete options.tools;
+        logger.debug(
+          "[NeuroLink] Dynamic tools resolved to non-array value, ignored",
+        );
+      }
+    }
+  }
+
+  /**
+   * Resolve dynamic arguments in StreamOptions, mutating the options in place.
+   */
+  private async resolveDynamicStreamOptions(
+    options: Record<string, unknown>,
+  ): Promise<void> {
+    const dynamicFields = [
+      "model",
+      "provider",
+      "temperature",
+      "maxTokens",
+      "systemPrompt",
+      "timeout",
+      "thinkingLevel",
+      "disableTools",
+      "enableAnalytics",
+      "enableEvaluation",
+    ] as const;
+
+    const hasDynamic =
+      dynamicFields.some((f) => typeof options[f] === "function") ||
+      typeof options.tools === "function";
+    if (!hasDynamic) {
+      return;
+    }
+
+    // Detect inline context (same as generate path)
+    const inlineCtx = options.context as Record<string, unknown> | undefined;
+    const hasInlineCtx =
+      inlineCtx &&
+      typeof inlineCtx === "object" &&
+      ("user" in inlineCtx || "tenant" in inlineCtx || "session" in inlineCtx);
+
+    await this.resolveDynamicFields(
+      options,
+      dynamicFields,
+      hasInlineCtx ? inlineCtx : undefined,
+    );
   }
 }
 

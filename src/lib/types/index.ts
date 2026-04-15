@@ -60,3 +60,9 @@ export * from "./exporter.js";
 export * from "./span.js";
 export * from "./imageGen.js";
 export * from "./elicitation.js";
+
+// Dynamic Arguments types - dynamic configuration
+export * from "./dynamic.js";
+
+// Dynamic Arguments - Rich enterprise layer (ArgumentResolver, Registry, etc.)
+export * from "./argumentResolution.js";

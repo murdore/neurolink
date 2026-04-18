@@ -162,7 +162,11 @@ import { TaskManager } from "./tasks/taskManager.js";
 import { createTaskTools } from "./tasks/tools/taskTools.js";
 import { ATTR } from "./telemetry/attributes.js";
 import { tracers } from "./telemetry/tracers.js";
-// NEW: Generate function imports
+// Voice integration imports
+import type { RealtimeConfig, RealtimeSession } from "./types/index.js";
+import type { STTOptions, STTResult } from "./types/index.js";
+import type { TTSOptions, TTSResult } from "./types/index.js";
+import type { VoiceProviderName } from "./types/index.js";
 import {
   getConversationMessages,
   storeConversationTurn,
@@ -216,6 +220,7 @@ import {
 import { isNonNullObject } from "./utils/typeUtils.js";
 import { getWorkflow } from "./workflow/core/workflowRegistry.js";
 import { runWorkflow } from "./workflow/core/workflowRunner.js";
+// (voice imports removed — use TTSProcessor/STTProcessor/RealtimeProcessor instead)
 
 /**
  * NL-002: Classify MCP error messages into categories for AI disambiguation.
@@ -3682,9 +3687,39 @@ Current user's request: ${currentInput}`;
       originalPrompt,
       factoryResult,
     );
+    // STT preprocessing: transcribe audio input before LLM generation
+    let sttTranscription: STTResult | undefined;
+    if (options.stt?.enabled && options.stt.audio) {
+      try {
+        // Ensure STT handlers are registered
+        if (!ProviderRegistry.isRegistered()) {
+          await ProviderRegistry.registerAllProviders();
+        }
+        const { STTProcessor } = await import("./utils/sttProcessor.js");
+        const sttProvider =
+          options.stt.provider ?? (options.provider as string) ?? "whisper";
+        sttTranscription = await STTProcessor.transcribe(
+          options.stt.audio,
+          sttProvider,
+          options.stt,
+        );
+        // Use transcription as the prompt if no text was provided
+        if (!textOptions.prompt && !textOptions.input?.text) {
+          textOptions.prompt = sttTranscription.text;
+          if (textOptions.input) {
+            textOptions.input.text = sttTranscription.text;
+          }
+        }
+      } catch (sttError) {
+        logger.error("[NeuroLink] STT transcription failed:", sttError);
+        // Don't block generation — STT is optional
+      }
+    }
+
     const textResult = await this.generateTextInternal(textOptions);
 
-    return this.finalizeGenerateRequestResult({
+    // Attach STT transcription to result
+    const generateResult = this.finalizeGenerateRequestResult({
       generateSpan,
       options,
       textOptions,
@@ -3693,6 +3728,10 @@ Current user's request: ${currentInput}`;
       originalPrompt,
       startTime,
     });
+    if (sttTranscription) {
+      generateResult.transcription = sttTranscription;
+    }
+    return generateResult;
   }
 
   private async maybeApplyGenerateOrchestration(
@@ -3811,6 +3850,7 @@ Current user's request: ${currentInput}`;
       input: options.input,
       region: options.region,
       tts: options.tts,
+      stt: options.stt,
       fileRegistry: this.fileRegistry,
       timeout: options.timeout,
       abortSignal: options.abortSignal,
@@ -3934,6 +3974,7 @@ Current user's request: ${currentInput}`;
           }
         : undefined,
       audio: textResult.audio,
+      transcription: textResult.transcription,
       video: textResult.video,
       ppt: textResult.ppt,
       ...(textResult.retries && { retries: textResult.retries }),
@@ -11932,6 +11973,90 @@ Current user's request: ${currentInput}`;
    * });
    * ```
    */
+  // ========================================
+  // Voice API
+  // ========================================
+
+  /**
+   * Synthesize text to speech.
+   *
+   * Thin wrapper over TTSProcessor. Providers are registered in providerRegistry.ts.
+   *
+   * @param text - Text to convert to speech
+   * @param options - TTS options including provider selection
+   * @returns TTS result with audio buffer and metadata
+   */
+  async synthesize(text: string, options?: TTSOptions): Promise<TTSResult> {
+    // Ensure TTS handlers are registered (happens inside registerAllProviders)
+    if (!ProviderRegistry.isRegistered()) {
+      await ProviderRegistry.registerAllProviders();
+    }
+    const { TTSProcessor } = await import("./utils/ttsProcessor.js");
+    const provider = options?.provider ?? "google-ai";
+    return TTSProcessor.synthesize(text, provider, options ?? {});
+  }
+
+  /**
+   * Transcribe audio to text (Speech-to-Text).
+   *
+   * Thin wrapper over STTProcessor. Providers are registered in providerRegistry.ts.
+   *
+   * @param audio - Audio buffer or ArrayBuffer
+   * @param options - STT options including provider selection and language
+   * @returns STT result with transcription text and metadata
+   */
+  async transcribe(
+    audio: Buffer | ArrayBuffer,
+    options?: STTOptions & { provider?: string },
+  ): Promise<STTResult> {
+    // Ensure STT handlers are registered (happens inside registerAllProviders)
+    if (!ProviderRegistry.isRegistered()) {
+      await ProviderRegistry.registerAllProviders();
+    }
+    const { STTProcessor } = await import("./utils/sttProcessor.js");
+    const provider = options?.provider ?? "whisper";
+    return STTProcessor.transcribe(audio, provider, options ?? {});
+  }
+
+  /**
+   * Start a realtime voice session for bidirectional audio.
+   *
+   * Creates a low-latency WebSocket connection for real-time voice
+   * communication using providers like OpenAI Realtime or Gemini Live.
+   *
+   * @param config - Realtime session configuration
+   * @param provider - Realtime provider name (defaults to "openai-realtime")
+   * @returns Realtime session for bidirectional communication
+   *
+   * @example
+   * ```typescript
+   * const session = await neurolink.startRealtimeVoice({
+   *   voice: "alloy",
+   *   instructions: "You are a helpful assistant.",
+   *   turnDetection: "server_vad",
+   * });
+   * ```
+   */
+  async startRealtimeVoice(
+    config: RealtimeConfig,
+    provider: VoiceProviderName = "openai-realtime",
+  ): Promise<RealtimeSession> {
+    logger.debug("[NeuroLink] Starting realtime voice session", {
+      provider,
+      voice: config.voice,
+    });
+
+    const { RealtimeProcessor } = await import("./voice/RealtimeVoiceAPI.js");
+    const session = await RealtimeProcessor.connect(
+      provider ?? config.provider ?? "openai-realtime",
+      config,
+    );
+
+    logger.debug("[NeuroLink] Realtime voice session started", { provider });
+
+    return session as unknown as RealtimeSession;
+  }
+
   async createEvaluationPipeline(
     configOrPreset:
       | import("./types/index.js").PipelineConfig
